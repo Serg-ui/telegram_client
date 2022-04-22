@@ -11,3 +11,4 @@ TELEGRAM_REPLAY_DELAY = 1
 # Типы сообщений
 MESSAGE = 'message'  # Обычное сообщение
 CONFIRM_CODE = 'confirm_code'  # код аутентификации
+CLIENT_IS_READY = 'client_is_ready'  # телеграм клиент запущен а авторизован

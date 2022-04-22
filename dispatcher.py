@@ -1,11 +1,17 @@
-#!/usr/bin/env python3
 
+import argparse
 import asyncio
+import logging
+
 import const
 from rabbit import get_connection, send_message_to_queue
 import json
 import random
 import string
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class Dispatcher:
@@ -14,6 +20,7 @@ class Dispatcher:
         self.phone = phone
         self.q_from_telegram = f'{const.FROM_TELEGRAM_QUEUE_NAME}{phone.replace("+", "")}'
         self.q_to_telegram = f'{const.TO_TELEGRAM_QUEUE_NAME}{phone.replace("+", "")}'
+        self.client_is_ready = False
 
     async def receive_message_from_telegram(self):
         """ Получает входящее сообщение из telegram """
@@ -41,6 +48,10 @@ class Dispatcher:
             await self.reply(msg)
         if msg['type'] == const.CONFIRM_CODE:
             await self.get_code(msg)
+        if msg['type'] == const.CLIENT_IS_READY:
+            self.client_is_ready = True
+            logger.info('Получено уведомление о готовности клиента')
+            loop.create_task(self.send_message_manually())
 
     async def reply(self, msg):
         """ Для тестирования. Отвечает адресату путем отправки сообщ в очередь на отправку в telegram """
@@ -56,7 +67,6 @@ class Dispatcher:
 
     async def get_code(self, msg):
         """ Получение у юзера кода подтверждения аутентификации в телеграм"""
-        loop = asyncio.get_running_loop()
         code = await loop.run_in_executor(None, input, msg['text'])
         data = {
             'type': const.CONFIRM_CODE,
@@ -66,10 +76,9 @@ class Dispatcher:
 
     async def send_message_manually(self):
         """ Ручное отправление сообщения через input """
-        loop = asyncio.get_running_loop()
 
         while True:
-            input_data = await loop.run_in_executor(None, input, 'Отправить сообщение. Через запятую телефон, текст: ')
+            input_data = await loop.run_in_executor(None, input, 'Отправить сообщение (stop для отмены). Через запятую телефон, текст: ')
             if input_data == 'stop':
                 break
 
@@ -80,9 +89,24 @@ class Dispatcher:
                 continue
 
             data = {
-                'type': 'message',
+                'type': const.MESSAGE,
                 'user': phone.strip(),
                 'text': text.strip()
             }
 
-            await send_message_to_queue(json.dumps(data), f'{const.TO_TELEGRAM_QUEUE_NAME}{self.phone}')
+            await send_message_to_queue(json.dumps(data), self.q_to_telegram)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='client data')
+
+    parser.add_argument('phone', type=str, help='client phone')
+    args = parser.parse_args()
+
+    dispatcher = Dispatcher(args.phone)
+
+    loop = asyncio.get_event_loop()
+
+    loop.create_task(dispatcher.receive_message_from_telegram())
+
+    loop.run_forever()

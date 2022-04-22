@@ -1,8 +1,15 @@
+import argparse
 import json
+import logging
+
 from telethon import TelegramClient, events
 import asyncio
 import const
 from rabbit import get_connection, send_message_to_queue
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class Telegram:
@@ -30,16 +37,32 @@ class Telegram:
             }
 
             await send_message_to_queue(json.dumps(data), self.q_from_telegram)
+            logger.info('Отправлен запрос кода диспетчеру')
         else:
-            self.is_login = True
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.listen_telegram())
+            await self.im_ready()
 
     async def accept_code(self, msg):
+        """ Отправка к telegram кода подтверждения """
+        logger.info(f'Получен код от диспетчера {msg["text"]}')
         await self.client.sign_in(self.phone, msg['text'])
+        await self.im_ready()
+
+    async def im_ready(self):
+        """ Запуск прослушивания, отправка уведомления диспетчеру о готовности """
+
+        if self.is_login:
+            logger.error('Сюда не должно попадать, когда клиент уже запущен')
+
         self.is_login = True
-        loop = asyncio.get_running_loop()
-        loop.create_task(self.listen_telegram())
+        a_loop = asyncio.get_running_loop()
+        a_loop.create_task(self.listen_telegram())
+
+        data = {
+            'type': const.CLIENT_IS_READY
+        }
+
+        await send_message_to_queue(json.dumps(data), self.q_from_telegram)
+        logger.info('Отправлено уведомление о готовности')
 
     async def listen_telegram(self):
         """ Прослушивает телеграм на входящие сообщения, отправляет полученные в диспетчер """
@@ -58,7 +81,7 @@ class Telegram:
                 'user': user,
                 'text': event.raw_text
             }
-
+            logger.info(f'Получено сообщение от {user}')
             await send_message_to_queue(json.dumps(data), self.q_from_telegram)
 
     async def listen_rabbit(self):
@@ -92,9 +115,26 @@ class Telegram:
 
     async def send(self, msg):
         if not self.is_login:
+            logger.error('Получен запрос на отправку, когда клиент не авторизован')
             return
         try:
             await self.client.send_message(msg['user'], msg['text'])
+            logger.info(f'Отправлено сообщение к {msg["user"]}')
         except ValueError as e:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, print, e)
+            logger.error(e)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='client data')
+    parser.add_argument('id', type=int, help='client id')
+    parser.add_argument('hash', type=str, help='client hash')
+    parser.add_argument('phone', type=str, help='client phone')
+    args = parser.parse_args()
+
+    telegram = Telegram(args.id, args.hash, args.phone)
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(telegram.login())
+    loop.create_task(telegram.listen_rabbit())
+
+    loop.run_forever()
