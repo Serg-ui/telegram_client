@@ -1,0 +1,100 @@
+import json
+from telethon import TelegramClient, events
+import asyncio
+import const
+from rabbit import get_connection, send_message_to_queue
+
+
+class Telegram:
+    def __init__(self, app_id, app_hash, phone, session_name=None):
+        if not session_name:
+            session_name = f'session_{phone.replace("+", "")}'
+        self.session_name = session_name
+        self.app_id = app_id
+        self.app_hash = app_hash
+        self.phone = phone
+        self.client = TelegramClient(self.session_name, self.app_id, self.app_hash)
+        self.is_login = False
+        self.q_from_telegram = f'{const.FROM_TELEGRAM_QUEUE_NAME}{phone.replace("+", "")}'
+        self.q_to_telegram = f'{const.TO_TELEGRAM_QUEUE_NAME}{phone.replace("+", "")}'
+
+    async def login(self):
+        """ Аутентификация """
+
+        await self.client.connect()
+        if not await self.client.is_user_authorized():
+            await self.client.send_code_request(self.phone)
+            data = {
+                'type': const.CONFIRM_CODE,
+                'text': 'Введите код подтверждения: '
+            }
+
+            await send_message_to_queue(json.dumps(data), self.q_from_telegram)
+        else:
+            self.is_login = True
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.listen_telegram())
+
+    async def accept_code(self, msg):
+        await self.client.sign_in(self.phone, msg['text'])
+        self.is_login = True
+        loop = asyncio.get_running_loop()
+        loop.create_task(self.listen_telegram())
+
+    async def listen_telegram(self):
+        """ Прослушивает телеграм на входящие сообщения, отправляет полученные в диспетчер """
+
+        client = self.client
+
+        @client.on(events.NewMessage(incoming=True))
+        async def listen_t(event):
+            sender = await event.get_sender()
+
+            user = sender.phone if sender.username is None else sender.username
+            user = sender.id if user is None else user
+
+            data = {
+                'type': const.MESSAGE,
+                'user': user,
+                'text': event.raw_text
+            }
+
+            await send_message_to_queue(json.dumps(data), self.q_from_telegram)
+
+    async def listen_rabbit(self):
+        """ Получение входящих сообщений из очереди """
+        connection = await get_connection()
+
+        queue_name = self.q_to_telegram
+
+        channel = await connection.channel()
+
+        await channel.set_qos(prefetch_count=100)
+
+        queue = await channel.declare_queue(queue_name, auto_delete=False, durable=True)
+
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process():
+                    # Сообщения из очереди
+
+                    await self.messages_from_rabbit(message.body.decode())
+
+    async def messages_from_rabbit(self, msg):
+        """ Определение типа сообщения, которое поступило из rabbitmq """
+        msg = json.loads(msg)
+
+        if msg['type'] == const.MESSAGE:  # это для отправки в телеграм
+            await self.send(msg)
+
+        if msg['type'] == const.CONFIRM_CODE:  # это код подтверждения аутентификации
+            await self.accept_code(msg)
+
+    async def send(self, msg):
+        if not self.is_login:
+            return
+        try:
+            await self.client.send_message(msg['user'], msg['text'])
+        except ValueError as e:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, print, e)
