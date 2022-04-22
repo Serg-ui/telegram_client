@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from dispatcher import Dispatcher
 from telegram_client import Telegram
 import asyncio

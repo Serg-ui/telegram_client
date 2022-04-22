@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import asyncio
 import const
 from rabbit import get_connection, send_message_to_queue
