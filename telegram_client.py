@@ -1,7 +1,7 @@
 import argparse
 import json
 import logging
-
+import os
 from telethon import TelegramClient, events
 import asyncio
 import const
@@ -43,9 +43,26 @@ class Telegram:
 
     async def accept_code(self, msg):
         """ Отправка к telegram кода подтверждения """
+
         logger.info(f'Получен код от диспетчера {msg["text"]}')
         await self.client.sign_in(self.phone, msg['text'])
         await self.im_ready()
+
+    async def check_status(self):
+        logger.info('Получен запрос статуса от оркестратора')
+        data = {
+            'type': const.CLIENT_CHECK_STATUS,
+            'phone': self.phone,
+            'pid': os.getpid(),
+            'text': None
+        }
+        if self.is_login:
+            data['text'] = 'running'  # запущен
+        else:
+            data['text'] = 'running'  # ждет от пользователя кода подтверждения
+
+        await send_message_to_queue(json.dumps(data), self.q_from_telegram)
+        print(data)
 
     async def im_ready(self):
         """ Запуск прослушивания, отправка уведомления диспетчеру о готовности """
@@ -69,7 +86,7 @@ class Telegram:
 
         client = self.client
 
-        @client.on(events.NewMessage(incoming=True))
+        @client.on(events.NewMessage)
         async def listen_t(event):
             sender = await event.get_sender()
 
@@ -94,24 +111,26 @@ class Telegram:
 
         await channel.set_qos(prefetch_count=100)
 
-        queue = await channel.declare_queue(queue_name, auto_delete=False, durable=True)
-
+        queue = await channel.declare_queue(queue_name, durable=True)
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
                 async with message.process():
-                    # Сообщения из очереди
+                    await self.messages_from_rabbit(message)
 
-                    await self.messages_from_rabbit(message.body.decode())
 
     async def messages_from_rabbit(self, msg):
         """ Определение типа сообщения, которое поступило из rabbitmq """
-        msg = json.loads(msg)
 
-        if msg['type'] == const.MESSAGE:  # это для отправки в телеграм
-            await self.send(msg)
+        msg_data = json.loads(msg.body.decode())
 
-        if msg['type'] == const.CONFIRM_CODE:  # это код подтверждения аутентификации
-            await self.accept_code(msg)
+        if msg_data['type'] == const.MESSAGE:  # это для отправки в телеграм
+            await self.send(msg_data)
+
+        if msg_data['type'] == const.CONFIRM_CODE:  # это код подтверждения аутентификации
+            await self.accept_code(msg_data)
+
+        if msg_data['type'] == const.CLIENT_CHECK_STATUS:  # это проверка статуса клиента
+            await self.check_status()
 
     async def send(self, msg):
         if not self.is_login:
