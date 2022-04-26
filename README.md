@@ -1,8 +1,8 @@
 Начальный вариант работы с telegram
 Необходимы библиотеки: telethon, aio_pika
 
-Запуск telegram - из консоли telegram_client.py id hash phone
-Запуск диспетчера - из консоли dispatcher.py phone 
+Запуск оркестратора - из консоли orchestrator.py
+Запуск диспетчера - из консоли dispatcher.py id hash phone
 
 Затем начинает работать прослушка telegram и rabbitmq.
 Диспетчер принимает поступившее сообщение из telegram и отвечает адресату с задержкой в n секунд.

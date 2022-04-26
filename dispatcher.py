@@ -8,7 +8,7 @@ import json
 import random
 import string
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(module)s %(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -32,6 +32,7 @@ class Dispatcher:
             'phone': self.phone
         }
         await send_message_to_queue(json.dumps(data), const.TO_ORCHESTRATOR_QUEUE_NAME)
+        logger.info('Отправлен запрос оркестратору на создание клиента')
 
     async def receive_message_from_telegram(self):
         """ Получает входящее сообщение из telegram """
@@ -45,20 +46,20 @@ class Dispatcher:
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
                 async with message.process():
-                    await self.messages_from_telegram(message)
-
+                    loop.create_task(self.messages_from_telegram(message))
 
     async def messages_from_telegram(self, msg):
         """ Определение типа сообщения от telegram """
 
         msg_data = json.loads(msg.body.decode())
         if msg_data['type'] == const.MESSAGE:
+            logger.info(f'Диспетчер {self.phone}: Получено сообщение от {msg_data["user"]}')
             await self.reply(msg_data)
         if msg_data['type'] == const.CONFIRM_CODE:
             await self.get_code(msg_data)
         if msg_data['type'] == const.CLIENT_IS_READY:
             self.client_is_ready = True
-            logger.info('Получено уведомление о готовности клиента')
+            logger.info(f'Диспетчер {self.phone}: Получено уведомление о готовности клиента')
             # loop.create_task(self.send_message_manually())  # Если нужно отправить сообщение через консоль
 
     async def reply(self, msg):
@@ -72,6 +73,7 @@ class Dispatcher:
 
         await asyncio.sleep(const.TELEGRAM_REPLAY_DELAY)
         await send_message_to_queue(json.dumps(msg), self.q_to_telegram)
+        logger.info(f'Диспетчер {self.phone}: Отправлено сообщение сообщение к {msg["user"]}')
 
     async def get_code(self, msg):
         """ Получение у юзера кода подтверждения аутентификации в телеграм"""
@@ -81,6 +83,7 @@ class Dispatcher:
             'text': code
         }
         await send_message_to_queue(json.dumps(data), self.q_to_telegram)
+        logger.info(f'Диспетчер {self.phone}: Отправлен код подтверждения {code}')
 
     async def send_message_manually(self):
         """ Ручное отправление сообщения через input """

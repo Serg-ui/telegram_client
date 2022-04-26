@@ -2,13 +2,25 @@ import argparse
 import json
 import logging
 import os
+import traceback
+
 from telethon import TelegramClient, events
 import asyncio
+
+from telethon.errors import PhoneCodeInvalidError, ApiIdInvalidError
+
 import const
 from rabbit import get_connection, send_message_to_queue
+import enum
 
 
-logging.basicConfig(level=logging.INFO)
+class ClientStatus(enum.Enum):
+    disconnected = 0
+    connected = 1
+    authorized = 2
+
+
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(module)s %(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -21,7 +33,7 @@ class Telegram:
         self.app_hash = app_hash
         self.phone = phone
         self.client = TelegramClient(self.session_name, self.app_id, self.app_hash)
-        self.is_login = False
+        self.status = ClientStatus.disconnected
         self.q_from_telegram = f'{const.FROM_TELEGRAM_QUEUE_NAME}{phone.replace("+", "")}'
         self.q_to_telegram = f'{const.TO_TELEGRAM_QUEUE_NAME}{phone.replace("+", "")}'
 
@@ -29,15 +41,23 @@ class Telegram:
         """ Аутентификация """
 
         await self.client.connect()
-        if not await self.client.is_user_authorized():
-            await self.client.send_code_request(self.phone)
-            data = {
-                'type': const.CONFIRM_CODE,
-                'text': 'Введите код подтверждения: '
-            }
+        self.status = ClientStatus.connected
 
-            await send_message_to_queue(json.dumps(data), self.q_from_telegram)
-            logger.info('Отправлен запрос кода диспетчеру')
+        if not await self.client.is_user_authorized():
+
+            try:
+                await self.client.send_code_request(self.phone)
+                data = {
+                    'type': const.CONFIRM_CODE,
+                    'text': 'Введите код подтверждения: '
+                }
+
+                await send_message_to_queue(json.dumps(data), self.q_from_telegram)
+                logger.info('Отправлен запрос кода диспетчеру')
+            except ApiIdInvalidError as e:
+                logger.error(e, exc_info=True)
+                return
+
         else:
             await self.im_ready()
 
@@ -45,32 +65,42 @@ class Telegram:
         """ Отправка к telegram кода подтверждения """
 
         logger.info(f'Получен код от диспетчера {msg["text"]}')
-        await self.client.sign_in(self.phone, msg['text'])
-        await self.im_ready()
+
+        try:
+            await self.client.sign_in(self.phone, msg['text'])
+            await self.im_ready()
+        except PhoneCodeInvalidError as e:
+            logger.error(e)
+            data = {
+                'type': const.CONFIRM_CODE,
+                'text': 'Код неверный, введите еще раз: '
+            }
+
+            await send_message_to_queue(json.dumps(data), self.q_from_telegram)
+
+        # todo
+        except:
+            logger.error("uncaught exception: %s", traceback.format_exc())
 
     async def check_status(self):
         logger.info('Получен запрос статуса от оркестратора')
+
         data = {
             'type': const.CLIENT_CHECK_STATUS,
             'phone': self.phone,
             'pid': os.getpid(),
-            'text': None
+            'status': self.status.name
         }
-        if self.is_login:
-            data['text'] = 'running'  # запущен
-        else:
-            data['text'] = 'running'  # ждет от пользователя кода подтверждения
 
-        await send_message_to_queue(json.dumps(data), self.q_from_telegram)
-        print(data)
+        await send_message_to_queue(json.dumps(data), const.TO_ORCHESTRATOR_QUEUE_NAME)
 
     async def im_ready(self):
         """ Запуск прослушивания, отправка уведомления диспетчеру о готовности """
 
-        if self.is_login:
+        if self.status == ClientStatus.authorized:
             logger.error('Сюда не должно попадать, когда клиент уже запущен')
 
-        self.is_login = True
+        self.status = ClientStatus.authorized
         a_loop = asyncio.get_running_loop()
         a_loop.create_task(self.listen_telegram())
 
@@ -86,20 +116,25 @@ class Telegram:
 
         client = self.client
 
-        @client.on(events.NewMessage)
+        @client.on(events.NewMessage(incoming=True))
         async def listen_t(event):
-            sender = await event.get_sender()
+            try:
+                sender = await event.get_sender()
 
-            user = sender.phone if sender.username is None else sender.username
-            user = sender.id if user is None else user
+                user = sender.phone if sender.username is None else sender.username
+                user = sender.id if user is None else user
 
-            data = {
-                'type': const.MESSAGE,
-                'user': user,
-                'text': event.raw_text
-            }
-            logger.info(f'Получено сообщение от {user}')
-            await send_message_to_queue(json.dumps(data), self.q_from_telegram)
+                data = {
+                    'type': const.MESSAGE,
+                    'user': user,
+                    'text': event.raw_text
+                }
+                logger.info(f'Получено сообщение от {user}')
+                await send_message_to_queue(json.dumps(data), self.q_from_telegram)
+
+            # todo
+            except:
+                logger.error("uncaught exception: %s", traceback.format_exc())
 
     async def listen_rabbit(self):
         """ Получение входящих сообщений из очереди """
@@ -115,8 +150,7 @@ class Telegram:
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
                 async with message.process():
-                    await self.messages_from_rabbit(message)
-
+                    loop.create_task(self.messages_from_rabbit(message))
 
     async def messages_from_rabbit(self, msg):
         """ Определение типа сообщения, которое поступило из rabbitmq """
@@ -133,14 +167,18 @@ class Telegram:
             await self.check_status()
 
     async def send(self, msg):
-        if not self.is_login:
-            logger.error('Получен запрос на отправку, когда клиент не авторизован')
+        """ Отправка сообщения адресату в telegram """
+
+        if self.status != ClientStatus.authorized:
+            logger.error('Получен запрос на отправку сообщения, когда клиент еще не авторизован')
             return
         try:
             await self.client.send_message(msg['user'], msg['text'])
             logger.info(f'Отправлено сообщение к {msg["user"]}')
-        except ValueError as e:
-            logger.error(e)
+
+        # todo
+        except:
+            logger.error("uncaught exception: %s", traceback.format_exc())
 
 
 if __name__ == '__main__':
